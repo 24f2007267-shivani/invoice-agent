@@ -1,4 +1,6 @@
-import os, json, sqlite3, hashlib, secrets, time, re, urllib.request, urllib.error
+import os, json, hashlib, secrets, time, re, urllib.request, urllib.error
+import psycopg
+from psycopg.rows import dict_row
 from contextlib import contextmanager
 from typing import Any
 from fastapi import FastAPI, Request, Header
@@ -9,9 +11,9 @@ APP_VERSION = "1.0.0"
 BASE_PATH = os.getenv("A2A_BASE_PATH", "/a2a").rstrip("/")
 if BASE_PATH == "/":
     BASE_PATH = ""
-PUBLIC_BASE_URL = os.getenv("A2A_BASE_URL", "").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("A2A_BASE_URL", "").strip()
 AGENT_TOKEN = os.getenv("AGENT_BEARER_TOKEN", "")
-DB_PATH = os.getenv("DATABASE_PATH", "/var/data/invoice-agent.sqlite3")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("DATABASE_PRIVATE_URL")
 AI_API_URL = os.getenv("AI_API_URL", "https://api.openai.com/v1/chat/completions")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
@@ -39,33 +41,35 @@ def principal_for(token: str) -> str:
 
 @contextmanager
 def db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=20, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=20000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured for Render PostgreSQL")
+    # autocommit=True preserves the explicit transaction boundaries used below.
+    conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row, connect_timeout=10)
     try:
         yield conn
     finally:
         conn.close()
 
 def init_db():
-    with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS tasks (
+    statements = [
+        """CREATE TABLE IF NOT EXISTS tasks (
           task_id TEXT PRIMARY KEY, principal TEXT NOT NULL, context_id TEXT NOT NULL,
           batch_id TEXT NOT NULL, state TEXT NOT NULL, task_json TEXT NOT NULL,
-          created_at REAL NOT NULL, updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(principal, created_at);
-        CREATE TABLE IF NOT EXISTS messages (
+          created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(principal, created_at)",
+        """CREATE TABLE IF NOT EXISTS messages (
           principal TEXT NOT NULL, message_id TEXT NOT NULL, message_hash TEXT NOT NULL,
           task_id TEXT NOT NULL, PRIMARY KEY(principal, message_id)
-        );
-        CREATE TABLE IF NOT EXISTS decisions (
-          package_hash TEXT PRIMARY KEY, decision_json TEXT NOT NULL, created_at REAL NOT NULL
-        );
-        """)
+        )""",
+        """CREATE TABLE IF NOT EXISTS decisions (
+          package_hash TEXT PRIMARY KEY, decision_json TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL
+        )"""
+    ]
+    with db() as c:
+        for statement in statements:
+            c.execute(statement)
+
 init_db()
 
 def make_part(mime: str, data: dict) -> dict:
@@ -78,18 +82,18 @@ def err(status: int, code: str):
     return JSONResponse({"error": {"code": code}}, status_code=status, media_type=A2A_MIME)
 
 def load_task(c, task_id, principal):
-    row = c.execute("SELECT task_json FROM tasks WHERE task_id=? AND principal=?", (task_id, principal)).fetchone()
+    row = c.execute("SELECT task_json FROM tasks WHERE task_id=%s AND principal=%s", (task_id, principal)).fetchone()
     return json.loads(row["task_json"]) if row else None
 
 def store_task(c, task: dict, principal: str, batch_id: str):
     now = time.time()
     c.execute("""INSERT INTO tasks(task_id,principal,context_id,batch_id,state,task_json,created_at,updated_at)
-                 VALUES(?,?,?,?,?,?,?,?)""",
+                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
               (task["id"], principal, task["contextId"], batch_id, task["status"]["state"],
                canonical(task), now, now))
 
 def update_task(c, task: dict, principal: str, batch_id: str):
-    c.execute("UPDATE tasks SET state=?, task_json=?, updated_at=? WHERE task_id=? AND principal=?",
+    c.execute("UPDATE tasks SET state=%s, task_json=%s, updated_at=%s WHERE task_id=%s AND principal=%s",
               (task["status"]["state"], canonical(task), time.time(), task["id"], principal))
 
 def all_strings(obj):
@@ -149,7 +153,7 @@ def decide(packages):
     with db() as c:
         for p in packages:
             key = package_key(p)
-            row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=?", (key,)).fetchone()
+            row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=%s", (key,)).fetchone()
             if row:
                 out[str(p.get("packageId", p.get("id", "")))] = json.loads(row["decision_json"])
             else:
@@ -160,9 +164,9 @@ def decide(packages):
             raise ValueError("AI returned wrong proposal count")
         with db() as c:
             for (key, package), proposal in zip(missing, generated):
-                c.execute("INSERT OR IGNORE INTO decisions(package_hash,decision_json,created_at) VALUES(?,?,?)",
+                c.execute("INSERT INTO decisions(package_hash,decision_json,created_at) VALUES(%s,%s,%s) ON CONFLICT (package_hash) DO NOTHING",
                           (key, canonical(proposal), time.time()))
-                row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=?", (key,)).fetchone()
+                row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=%s", (key,)).fetchone()
                 out[str(package.get("packageId", package.get("id", "")))] = json.loads(row["decision_json"])
     return out
 
@@ -215,7 +219,7 @@ def validate_body_size(body: bytes):
 
 @app.get("/.well-known/agent-card.json")
 async def agent_card():
-    base = PUBLIC_BASE_URL or "https://example.invalid" + (BASE_PATH + "/" if BASE_PATH else "/")
+    base = (PUBLIC_BASE_URL.rstrip("/") + "/" if PUBLIC_BASE_URL else "https://example.invalid" + (BASE_PATH + "/" if BASE_PATH else "/"))
     return JSONResponse({
       "name": "Invoice Action Agent",
       "description": "Evidence-based invoice action proposals with approval-gated receipts and persistent task state.",
@@ -243,8 +247,8 @@ async def message_send(request: Request):
     if not isinstance(message_id, str) or not message_id: return err(400, "INVALID_MESSAGE_ID")
     message_hash = digest(canonical(message))
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-        existing = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=? AND message_id=?",
+        c.execute("BEGIN")
+        existing = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=%s AND message_id=%s",
                              (principal, message_id)).fetchone()
         if existing:
             if existing["message_hash"] != message_hash:
@@ -274,7 +278,7 @@ async def message_send(request: Request):
             task = {"id": task_id, "contextId": context_id, "status": {"state": "TASK_STATE_WORKING"},
                     "history": [message], "artifacts": []}
             store_task(c, task, principal, batch_id)
-            c.execute("INSERT INTO messages(principal,message_id,message_hash,task_id) VALUES(?,?,?,?)",
+            c.execute("INSERT INTO messages(principal,message_id,message_hash,task_id) VALUES(%s,%s,%s,%s)",
                       (principal, message_id, message_hash, task_id))
             c.execute("COMMIT")
     if batch_part:
@@ -297,14 +301,14 @@ async def message_send(request: Request):
             task["status"] = {"state": "TASK_STATE_INPUT_REQUIRED"}
             task["artifacts"] = [artifact]
             with db() as c:
-                c.execute("BEGIN IMMEDIATE")
+                c.execute("BEGIN")
                 update_task(c, task, principal, batch_id)
                 c.execute("COMMIT")
             return task_response(task)
         except Exception:
             # Do not expose provider errors or package contents. Task stays recoverable but no false proposal.
             with db() as c:
-                c.execute("BEGIN IMMEDIATE")
+                c.execute("BEGIN")
                 current = load_task(c, task_id, principal)
                 if current and current["status"]["state"] == "TASK_STATE_WORKING":
                     current["status"] = {"state": "TASK_STATE_FAILED"}
@@ -319,9 +323,9 @@ async def message_send(request: Request):
         if not isinstance(task_id, str) or not isinstance(context_id, str):
             return err(400, "INVALID_CONTINUATION")
         with db() as c:
-            c.execute("BEGIN IMMEDIATE")
+            c.execute("BEGIN")
             # Continuation idempotency is checked under the same write lock as terminalization.
-            prior = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=? AND message_id=?",
+            prior = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=%s AND message_id=%s",
                               (principal, message_id)).fetchone()
             if prior:
                 if prior["message_hash"] != message_hash:
@@ -366,11 +370,10 @@ async def message_send(request: Request):
                                       "parts": [make_part(RECEIPTS_MIME, {"batchId": data["batchId"], "executions": executions})]})
             task["status"] = {"state": "TASK_STATE_COMPLETED"}
             update_task(c, task, principal, data["batchId"])
-            c.execute("INSERT INTO messages(principal,message_id,message_hash,task_id) VALUES(?,?,?,?)",
+            c.execute("INSERT INTO messages(principal,message_id,message_hash,task_id) VALUES(%s,%s,%s,%s)",
                       (principal, message_id, message_hash, task_id))
             c.execute("COMMIT")
         return task_response(task)
-    c.execute("ROLLBACK")
     return err(415, "UNSUPPORTED_MESSAGE_PART")
 
 @app.get(BASE_PATH + "/tasks")
@@ -382,7 +385,7 @@ async def list_tasks(request: Request):
     if request.headers.get("a2a-version") != "1.0": return err(400, "UNSUPPORTED_A2A_VERSION")
     principal = principal_for(h[7:])
     with db() as c:
-        rows = c.execute("SELECT task_json FROM tasks WHERE principal=? ORDER BY created_at DESC", (principal,)).fetchall()
+        rows = c.execute("SELECT task_json FROM tasks WHERE principal=%s ORDER BY created_at DESC", (principal,)).fetchall()
     return JSONResponse({"tasks": [json.loads(r["task_json"]) for r in rows]}, media_type=A2A_MIME)
 
 @app.get(BASE_PATH + "/tasks/{task_id}")
@@ -405,7 +408,7 @@ async def cancel_task(task_id: str, request: Request):
     if request.headers.get("content-type", "").split(";")[0].strip().lower() != A2A_MIME: return err(415, "UNSUPPORTED_MEDIA_TYPE")
     principal = principal_for(h[7:])
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
+        c.execute("BEGIN")
         task = load_task(c, task_id, principal)
         if not task: c.execute("ROLLBACK"); return err(404, "TASK_NOT_FOUND")
         if task["status"]["state"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"):
