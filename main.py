@@ -12,7 +12,6 @@ BASE_PATH = os.getenv("A2A_BASE_PATH", "/a2a").rstrip("/")
 if BASE_PATH == "/":
     BASE_PATH = ""
 PUBLIC_BASE_URL = os.getenv("A2A_BASE_URL", "").strip()
-AGENT_TOKEN = os.getenv("AGENT_BEARER_TOKEN", "")
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("DATABASE_PRIVATE_URL")
 AI_API_URL = os.getenv("AI_API_URL", "https://api.openai.com/v1/chat/completions")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
@@ -81,8 +80,11 @@ def task_response(task: dict):
 def err(status: int, code: str):
     return JSONResponse({"error": {"code": code}}, status_code=status, media_type=A2A_MIME)
 
-def load_task(c, task_id, principal):
-    row = c.execute("SELECT task_json FROM tasks WHERE task_id=%s AND principal=%s", (task_id, principal)).fetchone()
+def load_task(c, task_id, principal, for_update=False):
+    q = "SELECT task_json FROM tasks WHERE task_id=%s AND principal=%s"
+    if for_update:
+        q += " FOR UPDATE"
+    row = c.execute(q, (task_id, principal)).fetchone()
     return json.loads(row["task_json"]) if row else None
 
 def store_task(c, task: dict, principal: str, batch_id: str):
@@ -147,27 +149,36 @@ Use exactly three decisive bracketed references that literally occur in the rele
         raise ValueError("AI response has no proposals array")
     return parsed["proposals"]
 
+def pid_of(p):
+    return str(p.get("packageId", p.get("id", "")))
+
 def decide(packages):
-    # Reuse stable decisions across new batch/task namespaces.
+    # Reuse stable decisions across new batch/task namespaces (keyed by package content).
     out, missing = {}, []
     with db() as c:
         for p in packages:
             key = package_key(p)
             row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=%s", (key,)).fetchone()
             if row:
-                out[str(p.get("packageId", p.get("id", "")))] = json.loads(row["decision_json"])
+                out[pid_of(p)] = json.loads(row["decision_json"])
             else:
                 missing.append((key, p))
     if missing:
         generated = ask_ai([p for _, p in missing])
-        if len(generated) != len(missing):
-            raise ValueError("AI returned wrong proposal count")
+        by_id = {}
+        for g in generated:
+            if isinstance(g, dict) and isinstance(g.get("packageId"), str):
+                by_id[g["packageId"]] = g
         with db() as c:
-            for (key, package), proposal in zip(missing, generated):
+            for key, package in missing:
+                proposal = by_id.get(pid_of(package))
+                if proposal is None:
+                    raise ValueError("AI omitted a package")
+                validate_proposal(proposal, package, pid_of(package), "act_validation_only")  # never cache bad output
                 c.execute("INSERT INTO decisions(package_hash,decision_json,created_at) VALUES(%s,%s,%s) ON CONFLICT (package_hash) DO NOTHING",
                           (key, canonical(proposal), time.time()))
                 row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=%s", (key,)).fetchone()
-                out[str(package.get("packageId", package.get("id", "")))] = json.loads(row["decision_json"])
+                out[pid_of(package)] = json.loads(row["decision_json"])
     return out
 
 def validate_proposal(p, package, package_id, action_id):
@@ -202,24 +213,46 @@ def validate_proposal(p, package, package_id, action_id):
                       "amountMinor": amount, "currency": currency},
             "evidenceRefs": refs, "rationale": rationale}
 
-def auth_principal(request: Request):
-    if not AGENT_TOKEN:
-        return None, err(503, "AUTH_NOT_CONFIGURED")
-    h = request.headers.get("authorization", "")
-    if not h.startswith("Bearer ") or h[7:] != AGENT_TOKEN:
+def bearer_token(request: Request):
+    parts = request.headers.get("authorization", "").strip().split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+        return parts[1].strip()
+    return None
+
+def auth_principal(request: Request, need_body_type=True):
+    # Every distinct non-empty Bearer token is its own user (principal = hash of the token).
+    token = bearer_token(request)
+    if token is None:
         return None, err(401, "UNAUTHORIZED")
-    if request.headers.get("a2a-version") != "1.0":
+    if request.headers.get("a2a-version", "").strip() != "1.0":
         return None, err(400, "UNSUPPORTED_A2A_VERSION")
-    if request.headers.get("content-type", "").split(";")[0].strip().lower() != A2A_MIME:
+    if need_body_type and request.headers.get("content-type", "").split(";")[0].strip().lower() != A2A_MIME:
         return None, err(415, "UNSUPPORTED_MEDIA_TYPE")
-    return principal_for(h[7:]), None
+    return principal_for(token), None
+
+def wait_for_task(principal, task_id, timeout=40.0):
+    """A duplicate arriving while the original is still WORKING waits for the same complete Task."""
+    end = time.time() + timeout
+    while time.time() < end:
+        with db() as c:
+            t = load_task(c, task_id, principal)
+        if t is None:
+            return err(503, "RETRY")
+        if t["status"]["state"] != "TASK_STATE_WORKING":
+            return task_response(t)
+        time.sleep(0.25)
+    return err(503, "RETRY")
 
 def validate_body_size(body: bytes):
     return len(body) <= MAX_BODY
 
 @app.get("/.well-known/agent-card.json")
-async def agent_card():
-    base = (PUBLIC_BASE_URL.rstrip("/") + "/" if PUBLIC_BASE_URL else "https://example.invalid" + (BASE_PATH + "/" if BASE_PATH else "/"))
+async def agent_card(request: Request):
+    if PUBLIC_BASE_URL:
+        base = PUBLIC_BASE_URL.rstrip("/") + "/"
+    else:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        base = "https://" + host + (BASE_PATH + "/" if BASE_PATH else "/")
     return JSONResponse({
       "name": "Invoice Action Agent",
       "description": "Evidence-based invoice action proposals with approval-gated receipts and persistent task state.",
@@ -248,15 +281,16 @@ async def message_send(request: Request):
     message_hash = digest(canonical(message))
     with db() as c:
         c.execute("BEGIN")
+        # Serialize concurrent requests carrying the same (principal, messageId).
+        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (principal + "\x00" + message_id,))
         existing = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=%s AND message_id=%s",
                              (principal, message_id)).fetchone()
         if existing:
             if existing["message_hash"] != message_hash:
                 c.execute("ROLLBACK")
                 return err(409, "IDEMPOTENCY_CONFLICT")
-            task = load_task(c, existing["task_id"], principal)
             c.execute("COMMIT")
-            return task_response(task)
+            return wait_for_task(principal, existing["task_id"])
         parts = message.get("parts", [])
         batch_part = next((x for x in parts if x.get("mediaType") == BATCH_MIME and isinstance(x.get("data"), dict)), None)
         result_part = next((x for x in parts if x.get("mediaType") == RESULTS_MIME and isinstance(x.get("data"), dict)), None)
@@ -298,24 +332,28 @@ async def message_send(request: Request):
                 proposals.append(validated)
             artifact = {"artifactId": "artifact_" + secrets.token_urlsafe(12),
                         "parts": [make_part(PROPOSALS_MIME, {"batchId": batch_id, "proposals": proposals})]}
-            task["status"] = {"state": "TASK_STATE_INPUT_REQUIRED"}
-            task["artifacts"] = [artifact]
             with db() as c:
                 c.execute("BEGIN")
-                update_task(c, task, principal, batch_id)
+                current = load_task(c, task_id, principal, for_update=True)
+                if current is None or current["status"]["state"] != "TASK_STATE_WORKING":
+                    c.execute("ROLLBACK")      # canceled while the model was running
+                    return task_response(current) if current else err(404, "TASK_NOT_FOUND")
+                current["status"] = {"state": "TASK_STATE_INPUT_REQUIRED"}
+                current["artifacts"] = [artifact]
+                update_task(c, current, principal, batch_id)
                 c.execute("COMMIT")
-            return task_response(task)
+            return task_response(current)
         except Exception:
             # Do not expose provider errors or package contents. Task stays recoverable but no false proposal.
+            # Release the reservation so the caller can safely retry the same message.
             with db() as c:
                 c.execute("BEGIN")
-                current = load_task(c, task_id, principal)
+                current = load_task(c, task_id, principal, for_update=True)
                 if current and current["status"]["state"] == "TASK_STATE_WORKING":
-                    current["status"] = {"state": "TASK_STATE_FAILED"}
-                    current["status"]["message"] = {"role": "ROLE_AGENT", "parts": [{"text": "Invoice analysis failed validation."}]}
-                    update_task(c, current, principal, batch_id)
+                    c.execute("DELETE FROM messages WHERE principal=%s AND message_id=%s", (principal, message_id))
+                    c.execute("DELETE FROM tasks WHERE task_id=%s AND principal=%s", (task_id, principal))
                 c.execute("COMMIT")
-            return err(422, "INVOICE_ANALYSIS_FAILED")
+            return err(503, "ANALYSIS_UNAVAILABLE_RETRY")
     if result_part:
         data = result_part["data"]
         task_id = message.get("taskId")
@@ -324,6 +362,7 @@ async def message_send(request: Request):
             return err(400, "INVALID_CONTINUATION")
         with db() as c:
             c.execute("BEGIN")
+            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (principal + "\x00" + message_id,))
             # Continuation idempotency is checked under the same write lock as terminalization.
             prior = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=%s AND message_id=%s",
                               (principal, message_id)).fetchone()
@@ -333,7 +372,7 @@ async def message_send(request: Request):
                 prior_task = load_task(c, prior["task_id"], principal)
                 c.execute("COMMIT")
                 return task_response(prior_task)
-            task = load_task(c, task_id, principal)
+            task = load_task(c, task_id, principal, for_update=True)
             if not task:
                 c.execute("ROLLBACK"); return err(404, "TASK_NOT_FOUND")
             if task.get("contextId") != context_id:
@@ -378,43 +417,33 @@ async def message_send(request: Request):
 
 @app.get(BASE_PATH + "/tasks")
 async def list_tasks(request: Request):
-    # For GET, protocol version and auth are required; no request media type is needed.
-    if not AGENT_TOKEN: return err(503, "AUTH_NOT_CONFIGURED")
-    h = request.headers.get("authorization", "")
-    if not h.startswith("Bearer ") or h[7:] != AGENT_TOKEN: return err(401, "UNAUTHORIZED")
-    if request.headers.get("a2a-version") != "1.0": return err(400, "UNSUPPORTED_A2A_VERSION")
-    principal = principal_for(h[7:])
+    principal, error = auth_principal(request, need_body_type=False)
+    if error: return error
     with db() as c:
         rows = c.execute("SELECT task_json FROM tasks WHERE principal=%s ORDER BY created_at DESC", (principal,)).fetchall()
     return JSONResponse({"tasks": [json.loads(r["task_json"]) for r in rows]}, media_type=A2A_MIME)
 
 @app.get(BASE_PATH + "/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
-    if not AGENT_TOKEN: return err(503, "AUTH_NOT_CONFIGURED")
-    h = request.headers.get("authorization", "")
-    if not h.startswith("Bearer ") or h[7:] != AGENT_TOKEN: return err(401, "UNAUTHORIZED")
-    if request.headers.get("a2a-version") != "1.0": return err(400, "UNSUPPORTED_A2A_VERSION")
+    principal, error = auth_principal(request, need_body_type=False)
+    if error: return error
     with db() as c:
-        task = load_task(c, task_id, principal_for(h[7:]))
-    if not task: return err(404, "TASK_NOT_FOUND")
+        task = load_task(c, task_id, principal)
+    if not task: return err(404, "NOT_FOUND")
     return JSONResponse(task, media_type=A2A_MIME)
 
 @app.post(BASE_PATH + "/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request):
-    if not AGENT_TOKEN: return err(503, "AUTH_NOT_CONFIGURED")
-    h = request.headers.get("authorization", "")
-    if not h.startswith("Bearer ") or h[7:] != AGENT_TOKEN: return err(401, "UNAUTHORIZED")
-    if request.headers.get("a2a-version") != "1.0": return err(400, "UNSUPPORTED_A2A_VERSION")
-    if request.headers.get("content-type", "").split(";")[0].strip().lower() != A2A_MIME: return err(415, "UNSUPPORTED_MEDIA_TYPE")
-    principal = principal_for(h[7:])
+    principal, error = auth_principal(request, need_body_type=False)
+    if error: return error
     with db() as c:
         c.execute("BEGIN")
-        task = load_task(c, task_id, principal)
-        if not task: c.execute("ROLLBACK"); return err(404, "TASK_NOT_FOUND")
+        task = load_task(c, task_id, principal, for_update=True)   # row lock: races with result continuation
+        if not task: c.execute("ROLLBACK"); return err(404, "NOT_FOUND")
         if task["status"]["state"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"):
             c.execute("ROLLBACK"); return err(409, "TASK_TERMINAL")
         task["status"] = {"state": "TASK_STATE_CANCELED"}
-        update_task(c, task, principal, task.get("batchId", ""))
+        update_task(c, task, principal, "")
         c.execute("COMMIT")
     return JSONResponse(task, media_type=A2A_MIME)
 
