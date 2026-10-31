@@ -282,7 +282,7 @@ async def message_send(request: Request):
     with db() as c:
         c.execute("BEGIN")
         # Serialize concurrent requests carrying the same (principal, messageId).
-        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (principal + "\x00" + message_id,))
+        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (principal + ":" + message_id,))
         existing = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=%s AND message_id=%s",
                              (principal, message_id)).fetchone()
         if existing:
@@ -362,7 +362,7 @@ async def message_send(request: Request):
             return err(400, "INVALID_CONTINUATION")
         with db() as c:
             c.execute("BEGIN")
-            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (principal + "\x00" + message_id,))
+            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (principal + ":" + message_id,))
             # Continuation idempotency is checked under the same write lock as terminalization.
             prior = c.execute("SELECT message_hash,task_id FROM messages WHERE principal=%s AND message_id=%s",
                               (principal, message_id)).fetchone()
