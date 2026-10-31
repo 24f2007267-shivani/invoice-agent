@@ -343,7 +343,12 @@ async def message_send(request: Request):
                 update_task(c, current, principal, batch_id)
                 c.execute("COMMIT")
             return task_response(current)
-        except Exception:
+        except Exception as exc:
+            # Log only the error type/message (never package contents) so the cause is visible in Render logs.
+            import traceback, sys
+            print("ANALYSIS_FAILED:", type(exc).__name__, str(exc)[:500], file=sys.stderr, flush=True)
+            if not isinstance(exc, ValueError):
+                traceback.print_exc()
             # Do not expose provider errors or package contents. Task stays recoverable but no false proposal.
             # Release the reservation so the caller can safely retry the same message.
             with db() as c:
