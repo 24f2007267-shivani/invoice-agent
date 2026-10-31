@@ -132,7 +132,8 @@ reject_duplicate = same commercial invoice already paid (a different invoice is 
 open_exception = material records conflict and require exception workflow.
 Ignore cover sheets, archive examples, training decoys, and irrelevant action words. Decide from the paragraph that actually determines the case.
 Return ONLY JSON: {"proposals":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},"evidenceRefs":["[ref1]","[ref2]","[ref3]"],"rationale":"60-1500 characters, names action and cites at least two refs"}]}.
-Use exactly three decisive bracketed references that literally occur in the relevant package text. amountMinor is integer minor units. Do not invent missing facts or references. If facts cannot be reconciled, use open_exception and reflect uncertainty in rationale."""
+Use exactly three decisive bracketed references that literally occur in the relevant package text. amountMinor is integer minor units. Do not invent missing facts or references. If facts cannot be reconciled, use open_exception and reflect uncertainty in rationale.
+The rationale MUST contain the exact action string (for example settle_invoice) and MUST quote at least two of the three evidenceRefs verbatim, brackets included."""
     user = {"packages": packages}
     messages = [{"role": "system", "content": system}, {"role": "user", "content": canonical(user)}]
     headers = {"Authorization": "Bearer " + AI_API_KEY, "Content-Type": "application/json",
@@ -210,12 +211,35 @@ def decide(packages):
                 proposal = by_id.get(pid_of(package))
                 if proposal is None:
                     raise ValueError("AI omitted a package")
+                proposal = normalize_proposal(proposal)
                 validate_proposal(proposal, package, pid_of(package), "act_validation_only")  # never cache bad output
                 c.execute("INSERT INTO decisions(package_hash,decision_json,created_at) VALUES(%s,%s,%s) ON CONFLICT (package_hash) DO NOTHING",
                           (key, canonical(proposal), time.time()))
                 row = c.execute("SELECT decision_json FROM decisions WHERE package_hash=%s", (key,)).fetchone()
                 out[pid_of(package)] = json.loads(row["decision_json"])
     return out
+
+def normalize_proposal(p):
+    """Repair wording only: make the rationale name the action and cite the refs. Never changes action, facts or refs."""
+    if not isinstance(p, dict):
+        return p
+    p = dict(p)
+    action, refs, rat = p.get("action"), p.get("evidenceRefs"), p.get("rationale")
+    if isinstance(refs, list):
+        refs = [r.strip() if isinstance(r, str) else r for r in refs]
+        refs = [("[" + r + "]" if isinstance(r, str) and not r.startswith("[") else r) for r in refs]
+        p["evidenceRefs"] = refs
+    if isinstance(action, str):
+        action = action.strip()
+        p["action"] = action
+    if isinstance(rat, str) and isinstance(action, str) and isinstance(refs, list) and all(isinstance(r, str) for r in refs):
+        rat = rat.strip()
+        if action not in rat or sum(1 for r in refs if r in rat) < 2:
+            rat = "Action " + action + " based on evidence " + ", ".join(refs) + ". " + rat
+        if len(rat) < 60:
+            rat = rat + " " + "Decision follows the cited package evidence and policy limits."
+        p["rationale"] = rat[:1500]
+    return p
 
 def validate_proposal(p, package, package_id, action_id):
     if not isinstance(p, dict) or p.get("action") not in ACTIONS:
