@@ -139,10 +139,17 @@ Use exactly three decisive bracketed references that literally occur in the rele
         {"role": "user", "content": canonical(user)}
     ], "response_format": {"type": "json_object"}}
     req = urllib.request.Request(AI_API_URL, data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + AI_API_KEY, "Content-Type": "application/json"},
+        headers={"Authorization": "Bearer " + AI_API_KEY, "Content-Type": "application/json",
+                 "Accept": "application/json", "User-Agent": "invoice-action-agent/1.0"},
         method="POST")
-    with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
-        raw = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode("utf-8", "replace")[:400]
+        except Exception: pass
+        raise RuntimeError("AI provider HTTP %s: %s" % (e.code, body))
     content = raw["choices"][0]["message"]["content"]
     parsed = json.loads(content)
     if not isinstance(parsed.get("proposals"), list):
