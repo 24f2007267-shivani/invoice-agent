@@ -134,27 +134,56 @@ Ignore cover sheets, archive examples, training decoys, and irrelevant action wo
 Return ONLY JSON: {"proposals":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"},"evidenceRefs":["[ref1]","[ref2]","[ref3]"],"rationale":"60-1500 characters, names action and cites at least two refs"}]}.
 Use exactly three decisive bracketed references that literally occur in the relevant package text. amountMinor is integer minor units. Do not invent missing facts or references. If facts cannot be reconciled, use open_exception and reflect uncertainty in rationale."""
     user = {"packages": packages}
-    payload = {"model": AI_MODEL, "temperature": 0, "messages": [
-        {"role": "system", "content": system},
-        {"role": "user", "content": canonical(user)}
-    ], "response_format": {"type": "json_object"}}
-    req = urllib.request.Request(AI_API_URL, data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + AI_API_KEY, "Content-Type": "application/json",
-                 "Accept": "application/json", "User-Agent": "invoice-action-agent/1.0"},
-        method="POST")
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": canonical(user)}]
+    headers = {"Authorization": "Bearer " + AI_API_KEY, "Content-Type": "application/json",
+               "Accept": "application/json", "User-Agent": "invoice-action-agent/1.0"}
+
+    def call(json_mode):
+        payload = {"model": AI_MODEL, "temperature": 0, "messages": messages}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        req = urllib.request.Request(AI_API_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = ""
+            try: body = e.read().decode("utf-8", "replace")[:400]
+            except Exception: pass
+            raise RuntimeError("AI provider HTTP %s: %s" % (e.code, body))
+
+    use_json_mode = os.getenv("AI_JSON_MODE", "1") != "0"
     try:
-        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try: body = e.read().decode("utf-8", "replace")[:400]
-        except Exception: pass
-        raise RuntimeError("AI provider HTTP %s: %s" % (e.code, body))
-    content = raw["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
-    if not isinstance(parsed.get("proposals"), list):
+        raw = call(use_json_mode)
+    except RuntimeError as e:
+        # Some models reject response_format; retry once without it.
+        if use_json_mode and "HTTP 400" in str(e):
+            raw = call(False)
+        else:
+            raise
+    content = raw["choices"][0]["message"]["content"] or ""
+    parsed = extract_json(content)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("proposals"), list):
         raise ValueError("AI response has no proposals array")
     return parsed["proposals"]
+
+def extract_json(text):
+    """Parse JSON from a model reply, tolerating code fences, reasoning text and surrounding prose."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except Exception:
+            pass
+    first, last = text.find("{"), text.rfind("}")
+    if first != -1 and last > first:
+        return json.loads(text[first:last + 1])
+    raise ValueError("AI reply contained no JSON")
 
 def pid_of(p):
     return str(p.get("packageId", p.get("id", "")))
